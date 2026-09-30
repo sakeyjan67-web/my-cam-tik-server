@@ -1,16 +1,20 @@
 """Flask API for video upload, feed delivery, and recommendation analytics."""
 
 import json
+import hashlib
+import hmac
 import logging
 import math
 import os
+import time
 import uuid
+from urllib.parse import quote, urlencode
 
 import requests
 import firebase_admin
 from google.api_core.exceptions import FailedPrecondition
 from firebase_admin import credentials, firestore
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from werkzeug.utils import secure_filename
 
 from algorithm import rank_videos
@@ -26,6 +30,12 @@ UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "/tmp/uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+PLAYBACK_SIGNING_SECRET = os.getenv("PLAYBACK_SIGNING_SECRET") or BOT_TOKEN
+PLAYBACK_URL_TTL_SECONDS = 15 * 60
+BACKEND_BASE_URL = os.getenv(
+    "BACKEND_BASE_URL",
+    "https://my-cam-tik-server-mhbn.vercel.app",
+).rstrip("/")
 
 
 def _connect_firebase():
@@ -53,6 +63,14 @@ def _error(message, status=400):
 
 def _json_body():
     return request.get_json(silent=True) or {}
+
+
+def _playback_signature(video_id, expires):
+    secret = PLAYBACK_SIGNING_SECRET
+    if not secret:
+        return None
+    message = f"{video_id}:{expires}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
 def _normalize_video_numbers(video):
@@ -255,6 +273,125 @@ def feed():
     except Exception:
         logger.exception("Feed request failed")
         return _error("Unable to load feed", 500)
+
+
+@app.route("/playback/<video_id>", methods=["GET"])
+def playback_url(video_id):
+    if db is None:
+        return _error("Firebase not connected", 503)
+    if not BOT_TOKEN or not PLAYBACK_SIGNING_SECRET:
+        return _error("Video playback is not configured", 503)
+    try:
+        snapshot = db.collection("videos").document(video_id).get()
+        if not snapshot.exists:
+            return _error("Video not found", 404)
+        video = snapshot.to_dict() or {}
+        if not video.get("file_id"):
+            return _error("Video file is unavailable", 404)
+
+        expires = int(time.time()) + PLAYBACK_URL_TTL_SECONDS
+        signature = _playback_signature(video_id, expires)
+        query = urlencode({"expires": expires, "sig": signature})
+        stream_url = (
+            f"{BACKEND_BASE_URL}/stream/{quote(video_id, safe='')}?{query}"
+        )
+        return jsonify({
+            "url": stream_url,
+            "expires_at": expires,
+        })
+    except Exception:
+        logger.exception("Could not create playback URL")
+        return _error("Unable to create playback URL", 500)
+
+
+@app.route("/stream/<video_id>", methods=["GET", "HEAD"])
+def stream_video(video_id):
+    if db is None or not BOT_TOKEN or not PLAYBACK_SIGNING_SECRET:
+        return _error("Video playback is not configured", 503)
+
+    expires_value = request.args.get("expires", "")
+    signature = request.args.get("sig", "")
+    try:
+        expires = int(expires_value)
+    except (TypeError, ValueError):
+        return _error("Invalid playback URL", 403)
+
+    now = int(time.time())
+    if expires < now or expires > now + PLAYBACK_URL_TTL_SECONDS + 5:
+        return _error("Playback URL expired", 403)
+    expected_signature = _playback_signature(video_id, expires)
+    if not expected_signature or not hmac.compare_digest(signature, expected_signature):
+        return _error("Invalid playback URL", 403)
+
+    try:
+        snapshot = db.collection("videos").document(video_id).get()
+        if not snapshot.exists:
+            return _error("Video not found", 404)
+        file_id = (snapshot.to_dict() or {}).get("file_id")
+        if not file_id:
+            return _error("Video file is unavailable", 404)
+
+        telegram_response = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+            params={"file_id": file_id},
+            timeout=(5, 20),
+        )
+        telegram_response.raise_for_status()
+        telegram_result = telegram_response.json()
+        file_path = (telegram_result.get("result") or {}).get("file_path")
+        if not telegram_result.get("ok") or not file_path:
+            return _error("Video file is unavailable", 502)
+
+        upstream_headers = {"Accept-Encoding": "identity"}
+        for header in ("Range", "If-Range"):
+            if request.headers.get(header):
+                upstream_headers[header] = request.headers[header]
+        upstream = requests.get(
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}",
+            headers=upstream_headers,
+            stream=True,
+            timeout=(5, 60),
+        )
+    except requests.RequestException as exc:
+        logger.warning("Telegram playback request failed: %s", type(exc).__name__)
+        return _error("Unable to retrieve video", 502)
+    except Exception:
+        logger.exception("Could not resolve video for streaming")
+        return _error("Unable to retrieve video", 502)
+
+    if upstream.status_code not in (200, 206, 416):
+        upstream.close()
+        return _error("Video source rejected the request", 502)
+
+    response_headers = {
+        "Content-Type": upstream.headers.get("Content-Type", "video/mp4"),
+        "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    for header in ("Content-Length", "Content-Range"):
+        if upstream.headers.get(header):
+            response_headers[header] = upstream.headers[header]
+
+    if request.method == "HEAD" or upstream.status_code == 416:
+        upstream.close()
+        return Response(status=upstream.status_code, headers=response_headers)
+
+    def generate_video():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    response = Response(
+        stream_with_context(generate_video()),
+        status=upstream.status_code,
+        headers=response_headers,
+    )
+    response.call_on_close(upstream.close)
+    return response
 
 
 @app.route("/recommendations", methods=["GET"])
