@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+from datetime import datetime
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -31,19 +32,13 @@ os.makedirs(
 )
 
 
-BOT_TOKEN = os.getenv(
-    "BOT_TOKEN"
-)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-
-CHANNEL_ID = os.getenv(
-    "CHANNEL_ID"
-)
-
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 
 # ==========================
-# FIREBASE CONNECT
+# FIREBASE
 # ==========================
 
 db = None
@@ -66,7 +61,6 @@ try:
             firebase_json
         )
 
-
     else:
 
         cred = credentials.Certificate(
@@ -83,10 +77,7 @@ try:
 
     db = firestore.client()
 
-
-    print(
-        "Firebase Connected"
-    )
+    print("Firebase Connected")
 
 
 except Exception as e:
@@ -99,7 +90,7 @@ except Exception as e:
 
 
 # ==========================
-# HOME PAGE
+# HOME
 # ==========================
 
 @app.route("/")
@@ -123,16 +114,11 @@ def upload():
 
     try:
 
-
         if "video" not in request.files:
 
             return jsonify({
-
-                "error":
-                "No video found"
-
+                "error":"No video found"
             }),400
-
 
 
         video = request.files["video"]
@@ -142,7 +128,6 @@ def upload():
             "title",
             "No title"
         )
-
 
 
         filename = secure_filename(
@@ -156,15 +141,7 @@ def upload():
         )
 
 
-        video.save(
-            filepath
-        )
-
-
-
-        print(
-            "Sending to Telegram..."
-        )
+        video.save(filepath)
 
 
 
@@ -172,7 +149,6 @@ def upload():
             "https://api.telegram.org/"
             f"bot{BOT_TOKEN}/sendVideo"
         )
-
 
 
         with open(filepath,"rb") as file:
@@ -184,22 +160,17 @@ def upload():
 
                 data={
 
-                    "chat_id":
-                    CHANNEL_ID,
+                    "chat_id": CHANNEL_ID,
 
-                    "caption":
-                    f"Title: {title}"
+                    "caption": title
 
                 },
-
 
                 files={
 
-                    "video":
-                    file
+                    "video":file
 
                 },
-
 
                 timeout=120
 
@@ -207,36 +178,26 @@ def upload():
 
 
 
-        telegram_result = response.json()
+        result = response.json()
 
 
 
-        print(
-            telegram_result
-        )
-
-
-
-        if not telegram_result.get("ok"):
+        if not result.get("ok"):
 
 
             return jsonify({
 
-                "error":
-                "Telegram upload failed",
+                "error":"Telegram failed",
 
-                "detail":
-                telegram_result
+                "detail":result
 
             }),500
 
 
 
-
         file_id = (
 
-            telegram_result
-            ["result"]
+            result["result"]
             ["video"]
             ["file_id"]
 
@@ -244,13 +205,7 @@ def upload():
 
 
 
-        print(
-            "Telegram Success"
-        )
-
-
-
-        # FIREBASE SAVE
+        # SAVE VIDEO DATA
 
         if db:
 
@@ -259,32 +214,38 @@ def upload():
                 "videos"
             ).add({
 
-                "title":
-                title,
+                "title":title,
 
-                "file_id":
-                file_id,
+                "file_id":file_id,
 
-                "filename":
-                filename
+                "filename":filename,
+
+                "views":0,
+
+                "likes":0,
+
+                "comments":0,
+
+                "shares":0,
+
+                "watch_time":0,
+
+                "completion_rate":0,
+
+                "skip_rate":0,
+
+                "created_at":
+                datetime.utcnow()
 
             })
 
 
 
-            print(
-                "Firebase Save Success"
-            )
-
-
-
         return jsonify({
 
-            "success":
-            True,
+            "success":True,
 
-            "file_id":
-            file_id
+            "file_id":file_id
 
         })
 
@@ -293,16 +254,9 @@ def upload():
     except Exception as e:
 
 
-        print(
-            "SERVER ERROR:",
-            e
-        )
-
-
         return jsonify({
 
-            "error":
-            str(e)
+            "error":str(e)
 
         }),500
 
@@ -310,12 +264,209 @@ def upload():
 
 
 # ==========================
-# LOCAL RUN
+# WATCH START
 # ==========================
 
-if __name__ == "__main__":
+@app.route(
+"/video/start",
+methods=["POST"]
+)
+def video_start():
+
+    data = request.json
+
+
+    ref = db.collection(
+        "watch_history"
+    ).document()
+
+
+    ref.set({
+
+        "user_id":
+        data["user_id"],
+
+        "video_id":
+        data["video_id"],
+
+        "start":
+        datetime.utcnow()
+
+    })
+
+
+    return jsonify({
+
+        "watch_id":ref.id
+
+    })
+
+
+
+
+# ==========================
+# WATCH END / SWIPE
+# ==========================
+
+@app.route(
+"/video/end",
+methods=["POST"]
+)
+def video_end():
+
+
+    data=request.json
+
+
+    seconds=data["watch_seconds"]
+
+    duration=data["video_length"]
+
+
+    completion = 0
+
+
+    if duration:
+
+        completion = seconds/duration
+
+
+
+    skipped=False
+
+
+    if seconds < 3:
+
+        skipped=True
+
+
+
+    db.collection(
+        "watch_history"
+    ).document(
+        data["watch_id"]
+    ).update({
+
+        "watch_seconds":
+        seconds,
+
+        "completion_rate":
+        completion,
+
+        "skipped":
+        skipped,
+
+        "end":
+        datetime.utcnow()
+
+    })
+
+
+
+    return jsonify({
+
+        "completion_rate":
+        completion,
+
+        "skipped":
+        skipped
+
+    })
+
+
+
+
+# ==========================
+# FEED ALGORITHM
+# ==========================
+
+@app.route("/feed")
+def feed():
+
+
+    videos=[]
+
+
+    docs=db.collection(
+        "videos"
+    ).stream()
+
+
+
+    for doc in docs:
+
+
+        video=doc.to_dict()
+
+
+
+        views=video.get(
+            "views",
+            0
+        )
+
+        likes=video.get(
+            "likes",
+            0
+        )
+
+        watch=video.get(
+            "completion_rate",
+            0
+        )
+
+
+        score=(
+
+            watch*50
+
+            +
+
+            (likes/views if views else 0)*30
+
+            -
+
+            video.get(
+                "skip_rate",
+                0
+            )*20
+
+        )
+
+
+
+        video["score"]=score
+
+
+        videos.append(video)
+
+
+
+    videos.sort(
+
+        key=lambda x:x["score"],
+
+        reverse=True
+
+    )
+
+
+    return jsonify(videos)
+
+
+
+
+# ==========================
+# RUN
+# ==========================
+
+if __name__=="__main__":
+
 
     app.run(
+
         host="0.0.0.0",
+
         port=5000
+
     )

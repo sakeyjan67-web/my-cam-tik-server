@@ -2,4 +2,4 @@ Flask
 requests
 firebase-admin
 gunicorn
-werkzeug
+Werkzeug
