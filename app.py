@@ -12,6 +12,7 @@ from urllib.parse import quote, urlencode
 
 import requests
 import firebase_admin
+from google.cloud.firestore_v1.base_query import FieldFilter
 from google.api_core.exceptions import FailedPrecondition
 from firebase_admin import credentials, firestore
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
@@ -121,6 +122,11 @@ def _profile_for(user_id):
     if isinstance(followed, dict):
         followed = list(followed.keys())
     return profile.get("interests") or {}, followed
+
+
+def _query_count(query):
+    result = query.count().get()
+    return int(result[0][0].value) if result else 0
 
 
 def _recommendation_page(user_id, limit, cursor=None):
@@ -273,6 +279,53 @@ def feed():
     except Exception:
         logger.exception("Feed request failed")
         return _error("Unable to load feed", 500)
+
+
+@app.route("/user/<creator_id>", methods=["GET"])
+def get_user_profile(creator_id):
+    if db is None:
+        return _error("Firebase not connected", 503)
+    creator_id = creator_id.strip()
+    if not creator_id:
+        return _error("creator_id is required")
+    try:
+        snapshot = db.collection("users").document(creator_id).get()
+        profile_exists = snapshot.exists
+        profile = snapshot.to_dict() or {} if profile_exists else {}
+
+        videos_count = _query_count(
+            db.collection("videos").where(
+                filter=FieldFilter("creator_id", "==", creator_id),
+            ),
+        )
+        followers_count = _query_count(
+            db.collection("users").where(
+                filter=FieldFilter("followed_creators", "array_contains", creator_id),
+            ),
+        )
+        if not profile_exists and videos_count == 0:
+            return _error("Creator not found", 404)
+
+        followed_creators = profile.get("followed_creators") or []
+        if isinstance(followed_creators, dict):
+            following_count = len(followed_creators)
+        elif isinstance(followed_creators, (list, tuple, set)):
+            following_count = len(followed_creators)
+        else:
+            following_count = None
+
+        return jsonify({
+            "username": str(profile.get("username") or creator_id),
+            "profile_image": profile.get("profile_image") or None,
+            "bio": str(profile.get("bio") or ""),
+            "followers_count": followers_count,
+            "following_count": following_count,
+            "videos_count": videos_count,
+            "verified_status": profile.get("verified_status"),
+        })
+    except Exception:
+        logger.exception("Creator profile request failed")
+        return _error("Unable to load creator profile", 500)
 
 
 @app.route("/playback/<video_id>", methods=["GET"])
@@ -458,6 +511,40 @@ def events():
         return _error("user_id and creator_id are required for follow events")
     payload = {key: data[key] for key in ("seconds", "duration_seconds", "creator_id") if key in data}
     return _event_response(event_type, user_id, video_id, payload, data.get("event_id"))
+
+
+@app.route("/comments/<video_id>", methods=["GET"])
+def list_comments(video_id):
+    if db is None:
+        return _error("Firebase not connected", 503)
+    try:
+        limit = min(100, max(1, int(request.args.get("limit", 50))))
+        video_ref = db.collection("videos").document(video_id)
+        if not video_ref.get().exists:
+            return _error("Video not found", 404)
+        documents = (
+            video_ref.collection("comments")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        comments = []
+        for document in documents:
+            item = document.to_dict() or {}
+            created_at = item.get("created_at")
+            comments.append({
+                "comment_id": document.id,
+                "user_id": item.get("user_id") or "",
+                "text": item.get("text") or "",
+                "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else None,
+            })
+        comments.reverse()
+        return jsonify(comments)
+    except (TypeError, ValueError):
+        return _error("limit must be an integer")
+    except Exception:
+        logger.exception("Comment listing failed")
+        return _error("Unable to load comments", 500)
 
 
 @app.route("/comment/<video_id>", methods=["POST"])
