@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-from datetime import datetime
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -33,12 +32,12 @@ os.makedirs(
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 
+
 # ==========================
-# FIREBASE
+# FIREBASE CONNECT
 # ==========================
 
 db = None
@@ -53,12 +52,8 @@ try:
 
     if firebase_data:
 
-        firebase_json = json.loads(
-            firebase_data
-        )
-
         cred = credentials.Certificate(
-            firebase_json
+            json.loads(firebase_data)
         )
 
     else:
@@ -121,6 +116,7 @@ def upload():
             }),400
 
 
+
         video = request.files["video"]
 
 
@@ -168,7 +164,7 @@ def upload():
 
                 files={
 
-                    "video":file
+                    "video": file
 
                 },
 
@@ -177,48 +173,65 @@ def upload():
             )
 
 
-
         result = response.json()
 
 
 
         if not result.get("ok"):
 
-
             return jsonify({
 
-                "error":"Telegram failed",
-
-                "detail":result
+                "error": result
 
             }),500
 
 
 
         file_id = (
-
             result["result"]
             ["video"]
             ["file_id"]
-
         )
 
 
 
-        # SAVE VIDEO DATA
+        # ======================
+        # SAVE FIREBASE
+        # ======================
 
         if db:
 
 
-            db.collection(
+            doc_ref = db.collection(
                 "videos"
-            ).add({
+            ).document()
 
-                "title":title,
 
-                "file_id":file_id,
 
-                "filename":filename,
+            doc_ref.set({
+
+                "video_id":
+                doc_ref.id,
+
+
+                "title":
+                title,
+
+
+                "file_id":
+                file_id,
+
+
+                "filename":
+                filename,
+
+
+                "created_at":
+                firestore.SERVER_TIMESTAMP,
+
+
+
+                # AUTO ANALYTICS
 
                 "views":0,
 
@@ -230,12 +243,11 @@ def upload():
 
                 "watch_time":0,
 
-                "completion_rate":0,
+                "completion_rate":0.0,
 
-                "skip_rate":0,
+                "skip_rate":0.0,
 
-                "created_at":
-                datetime.utcnow()
+                "score":0.0
 
             })
 
@@ -262,120 +274,6 @@ def upload():
 
 
 
-
-# ==========================
-# WATCH START
-# ==========================
-
-@app.route(
-"/video/start",
-methods=["POST"]
-)
-def video_start():
-
-    data = request.json
-
-
-    ref = db.collection(
-        "watch_history"
-    ).document()
-
-
-    ref.set({
-
-        "user_id":
-        data["user_id"],
-
-        "video_id":
-        data["video_id"],
-
-        "start":
-        datetime.utcnow()
-
-    })
-
-
-    return jsonify({
-
-        "watch_id":ref.id
-
-    })
-
-
-
-
-# ==========================
-# WATCH END / SWIPE
-# ==========================
-
-@app.route(
-"/video/end",
-methods=["POST"]
-)
-def video_end():
-
-
-    data=request.json
-
-
-    seconds=data["watch_seconds"]
-
-    duration=data["video_length"]
-
-
-    completion = 0
-
-
-    if duration:
-
-        completion = seconds/duration
-
-
-
-    skipped=False
-
-
-    if seconds < 3:
-
-        skipped=True
-
-
-
-    db.collection(
-        "watch_history"
-    ).document(
-        data["watch_id"]
-    ).update({
-
-        "watch_seconds":
-        seconds,
-
-        "completion_rate":
-        completion,
-
-        "skipped":
-        skipped,
-
-        "end":
-        datetime.utcnow()
-
-    })
-
-
-
-    return jsonify({
-
-        "completion_rate":
-        completion,
-
-        "skipped":
-        skipped
-
-    })
-
-
-
-
 # ==========================
 # FEED ALGORITHM
 # ==========================
@@ -383,85 +281,429 @@ def video_end():
 @app.route("/feed")
 def feed():
 
+    try:
 
-    videos=[]
+        if not db:
 
-
-    docs=db.collection(
-        "videos"
-    ).stream()
-
-
-
-    for doc in docs:
-
-
-        video=doc.to_dict()
+            return jsonify({
+                "error":"Firebase not connected"
+            }),500
 
 
 
-        views=video.get(
-            "views",
-            0
+        videos = []
+
+
+        docs = db.collection(
+            "videos"
+        ).stream()
+
+
+
+        for doc in docs:
+
+
+            data = doc.to_dict()
+
+
+
+            # SAFE NUMBER CONVERSION
+
+            views = int(
+                data.get("views",0) or 0
+            )
+
+            likes = int(
+                data.get("likes",0) or 0
+            )
+
+            comments = int(
+                data.get("comments",0) or 0
+            )
+
+            shares = int(
+                data.get("shares",0) or 0
+            )
+
+            watch_time = int(
+                data.get("watch_time",0) or 0
+            )
+
+
+            completion = float(
+                data.get("completion_rate",0) or 0
+            )
+
+
+            skip = float(
+                data.get("skip_rate",0) or 0
+            )
+
+
+
+            # ======================
+            # RECOMMENDATION SCORE
+            # ======================
+
+
+            like_rate = (
+                likes / views
+                if views else 0
+            )
+
+
+            comment_rate = (
+                comments / views
+                if views else 0
+            )
+
+
+            share_rate = (
+                shares / views
+                if views else 0
+            )
+
+
+
+            score = (
+
+                like_rate * 30
+
+                +
+
+                comment_rate * 20
+
+                +
+
+                share_rate * 35
+
+                +
+
+                completion * 20
+
+                +
+
+                min(watch_time,100) * 0.10
+
+                -
+
+                skip * 20
+
+            )
+
+
+
+            videos.append({
+
+                "video_id":
+                doc.id,
+
+
+                "title":
+                data.get("title",""),
+
+
+                "file_id":
+                data.get("file_id",""),
+
+
+                "filename":
+                data.get("filename",""),
+
+
+                "views":
+                views,
+
+
+                "likes":
+                likes,
+
+
+                "comments":
+                comments,
+
+
+                "shares":
+                shares,
+
+
+                "watch_time":
+                watch_time,
+
+
+                "completion_rate":
+                completion,
+
+
+                "skip_rate":
+                skip,
+
+
+                "score":
+                round(score,2)
+
+            })
+
+
+
+        videos.sort(
+
+            key=lambda x:x["score"],
+
+            reverse=True
+
         )
 
-        likes=video.get(
-            "likes",
-            0
-        )
-
-        watch=video.get(
-            "completion_rate",
-            0
-        )
 
 
-        score=(
+        return jsonify(videos)
 
-            watch*50
 
-            +
 
-            (likes/views if views else 0)*30
+    except Exception as e:
 
-            -
 
-            video.get(
-                "skip_rate",
+        return jsonify({
+
+            "error":str(e)
+
+        }),500
+
+
+
+
+
+# ==========================
+# ADD VIEW
+# ==========================
+
+@app.route(
+    "/view/<video_id>",
+    methods=["POST"]
+)
+def add_view(video_id):
+
+    try:
+
+        db.collection(
+            "videos"
+        ).document(
+            video_id
+        ).update({
+
+            "views":
+            firestore.Increment(1)
+
+        })
+
+
+        return jsonify({
+
+            "success":True
+
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":str(e)
+
+        }),500
+
+
+
+
+
+# ==========================
+# LIKE
+# ==========================
+
+@app.route(
+    "/like/<video_id>",
+    methods=["POST"]
+)
+def add_like(video_id):
+
+    try:
+
+        db.collection(
+            "videos"
+        ).document(
+            video_id
+        ).update({
+
+            "likes":
+            firestore.Increment(1)
+
+        })
+
+
+        return jsonify({
+
+            "success":True
+
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":str(e)
+
+        }),500
+
+
+
+
+
+# ==========================
+# SHARE
+# ==========================
+
+@app.route(
+    "/share/<video_id>",
+    methods=["POST"]
+)
+def add_share(video_id):
+
+    try:
+
+        db.collection(
+            "videos"
+        ).document(
+            video_id
+        ).update({
+
+            "shares":
+            firestore.Increment(1)
+
+        })
+
+
+        return jsonify({
+
+            "success":True
+
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":str(e)
+
+        }),500
+
+
+
+
+
+# ==========================
+# WATCH TIME
+# ==========================
+
+@app.route(
+    "/watch/<video_id>",
+    methods=["POST"]
+)
+def add_watch(video_id):
+
+    try:
+
+        data = request.json or {}
+
+
+        seconds = int(
+            data.get(
+                "seconds",
                 0
-            )*20
-
+            )
         )
 
 
+        db.collection(
+            "videos"
+        ).document(
+            video_id
+        ).update({
 
-        video["score"]=score
+            "watch_time":
+            firestore.Increment(seconds)
 
-
-        videos.append(video)
-
-
-
-    videos.sort(
-
-        key=lambda x:x["score"],
-
-        reverse=True
-
-    )
+        })
 
 
-    return jsonify(videos)
+        return jsonify({
+
+            "success":True
+
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":str(e)
+
+        }),500
+
 
 
 
 
 # ==========================
-# RUN
+# SKIP TRACK
 # ==========================
 
-if __name__=="__main__":
+@app.route(
+    "/skip/<video_id>",
+    methods=["POST"]
+)
+def add_skip(video_id):
 
+    try:
+
+        db.collection(
+            "videos"
+        ).document(
+            video_id
+        ).update({
+
+            "skip_rate":
+            firestore.Increment(0.01)
+
+        })
+
+
+        return jsonify({
+
+            "success":True
+
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":str(e)
+
+        }),500
+
+
+
+
+
+# ==========================
+# RUN SERVER
+# ==========================
+
+if __name__ == "__main__":
 
     app.run(
 
