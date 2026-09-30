@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import uuid
 
@@ -51,6 +52,32 @@ def _error(message, status=400):
 
 def _json_body():
     return request.get_json(silent=True) or {}
+
+
+def _normalize_video_numbers(video):
+    integer_fields = (
+        "views", "likes", "comments", "shares", "watch_sessions",
+        "rewatches", "completed_views", "skipped_views",
+    )
+    float_fields = (
+        "watch_time", "duration_seconds", "completion_total", "completion_rate",
+        "skip_rate", "trending_score",
+    )
+    for field in integer_fields:
+        if field in video:
+            try:
+                number = float(video[field] or 0)
+                video[field] = int(number) if math.isfinite(number) else 0
+            except (TypeError, ValueError, OverflowError):
+                video[field] = 0
+    for field in float_fields:
+        if field in video:
+            try:
+                number = float(video[field] or 0)
+                video[field] = number if math.isfinite(number) else 0.0
+            except (TypeError, ValueError, OverflowError):
+                video[field] = 0.0
+    return video
 
 
 def _event_response(event_type, user_id, video_id, payload=None, event_id=None):
@@ -105,7 +132,7 @@ def _recommendation_page(user_id, limit, cursor=None):
 
     candidates = []
     for snapshot in snapshots:
-        item = snapshot.to_dict() or {}
+        item = _normalize_video_numbers(snapshot.to_dict() or {})
         item["video_id"] = snapshot.id
         candidates.append(item)
 
