@@ -8,6 +8,7 @@ import uuid
 
 import requests
 import firebase_admin
+from google.api_core.exceptions import FailedPrecondition
 from firebase_admin import credentials, firestore
 from flask import Flask, jsonify, render_template, request
 from werkzeug.utils import secure_filename
@@ -61,22 +62,20 @@ def _normalize_video_numbers(video):
     )
     float_fields = (
         "watch_time", "duration_seconds", "completion_total", "completion_rate",
-        "skip_rate", "trending_score",
+        "skip_rate", "score", "trending_score",
     )
     for field in integer_fields:
-        if field in video:
-            try:
-                number = float(video[field] or 0)
-                video[field] = int(number) if math.isfinite(number) else 0
-            except (TypeError, ValueError, OverflowError):
-                video[field] = 0
+        try:
+            number = float(video.get(field, 0) or 0)
+            video[field] = int(number) if math.isfinite(number) else 0
+        except (TypeError, ValueError, OverflowError):
+            video[field] = 0
     for field in float_fields:
-        if field in video:
-            try:
-                number = float(video[field] or 0)
-                video[field] = number if math.isfinite(number) else 0.0
-            except (TypeError, ValueError, OverflowError):
-                video[field] = 0.0
+        try:
+            number = float(video.get(field, 0.0) or 0.0)
+            video[field] = number if math.isfinite(number) else 0.0
+        except (TypeError, ValueError, OverflowError):
+            video[field] = 0.0
     return video
 
 
@@ -119,7 +118,11 @@ def _recommendation_page(user_id, limit, cursor=None):
         if cursor_snapshot.exists:
             query = query.start_after(cursor_snapshot)
 
-    snapshots = list(query.stream())
+    snapshots = []
+    try:
+        snapshots = list(query.stream())
+    except FailedPrecondition:
+        logger.warning("Recommendation index missing; using newest-first fallback")
     if not snapshots:
         fallback_query = db.collection("videos").order_by(
             "created_at", direction=firestore.Query.DESCENDING
@@ -219,6 +222,7 @@ def upload():
             "completion_total": 0.0,
             "completion_rate": 0.0,
             "skip_rate": 0.0,
+            "score": 0.0,
             "trending_score": 0.12,
             "score_updated_at": firestore.SERVER_TIMESTAMP,
         })

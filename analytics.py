@@ -7,6 +7,8 @@ import uuid
 
 from firebase_admin import firestore
 
+from algorithm import calculate_score
+
 
 EVENT_WEIGHTS = {
     "view": 0.1,
@@ -46,6 +48,18 @@ def _as_nonnegative_float(value, field):
     if not math.isfinite(number) or number < 0:
         raise ValueError(f"{field} must be a non-negative finite number")
     return number
+
+
+def _stored_float(value):
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return number if math.isfinite(number) and number >= 0 else 0.0
+
+
+def _stored_int(value):
+    return int(_stored_float(value))
 
 
 def _interest_keys(video):
@@ -96,38 +110,53 @@ def record_event(db, event_type, user_id=None, video_id=None, payload=None, even
             fields = {}
             counter = VIDEO_COUNTERS.get(event_type)
             if counter:
-                fields[counter] = firestore.Increment(1)
+                fields[counter] = _stored_int(video.get(counter)) + 1
             if event_type == "watch":
-                old_views = max(0, int(video.get("views", 0) or 0))
-                old_sessions = max(0, int(video.get("watch_sessions", 0) or 0))
-                old_completed = max(0, int(video.get("completed_views", 0) or 0))
-                old_skipped = max(0, int(video.get("skipped_views", 0) or 0))
-                completion_total = max(0.0, float(video.get("completion_total", 0) or 0)) + completion
-                fields["watch_time"] = firestore.Increment(seconds)
-                fields["watch_sessions"] = firestore.Increment(1)
+                old_views = _stored_int(video.get("views"))
+                old_sessions = _stored_int(video.get("watch_sessions"))
+                old_completed = _stored_int(video.get("completed_views"))
+                old_skipped = _stored_int(video.get("skipped_views"))
+                completion_total = _stored_float(video.get("completion_total")) + completion
+                fields["watch_time"] = _stored_float(video.get("watch_time")) + seconds
+                fields["watch_sessions"] = old_sessions + 1
                 if completion >= 0.8:
-                    fields["completed_views"] = firestore.Increment(1)
                     old_completed += 1
+                    fields["completed_views"] = old_completed
                 if skipped:
-                    fields["skipped_views"] = firestore.Increment(1)
                     old_skipped += 1
+                    fields["skipped_views"] = old_skipped
                 fields["completion_rate"] = completion_total / max(1, old_sessions + 1)
                 fields["skip_rate"] = old_skipped / max(1, old_views)
-                fields["completion_total"] = firestore.Increment(completion)
+                fields["completion_total"] = completion_total
             elif event_type == "skip":
-                old_views = max(1, int(video.get("views", 0) or 0))
-                old_skipped = max(0, int(video.get("skipped_views", 0) or 0)) + 1
-                fields["skipped_views"] = firestore.Increment(1)
+                old_views = max(1, _stored_int(video.get("views")))
+                old_skipped = _stored_int(video.get("skipped_views")) + 1
+                fields["skipped_views"] = old_skipped
                 fields["skip_rate"] = old_skipped / old_views
 
             if event_type != "follow":
-                prior_score = max(0.0, float(video.get("trending_score", 0) or 0))
+                prior_score = _stored_float(video.get("trending_score"))
                 score_at = video.get("score_updated_at")
                 if score_at and hasattr(score_at, "timestamp"):
                     elapsed = max(0.0, datetime.now(timezone.utc).timestamp() - score_at.timestamp()) / 3600
                     prior_score *= math.exp(-math.log(2) * elapsed / 24)
                 fields["trending_score"] = max(0.0, prior_score + EVENT_WEIGHTS[event_type])
                 fields["score_updated_at"] = firestore.SERVER_TIMESTAMP
+            integer_metrics = (
+                "views", "likes", "comments", "shares", "watch_sessions",
+                "rewatches", "completed_views", "skipped_views",
+            )
+            float_metrics = (
+                "watch_time", "duration_seconds", "completion_total",
+                "completion_rate", "skip_rate", "trending_score",
+            )
+            for field in integer_metrics:
+                fields[field] = _stored_int(fields.get(field, video.get(field)))
+            for field in float_metrics:
+                if field in fields and fields[field] is firestore.SERVER_TIMESTAMP:
+                    continue
+                fields[field] = _stored_float(fields.get(field, video.get(field)))
+            fields["score"] = calculate_score({**video, **fields})
             transaction.update(video_ref, fields)
 
         if user_ref:
@@ -180,7 +209,17 @@ def create_watch(db, user_id, video_id):
     })
     record_event(db, "view", user_id, video_id, event_id=f"view:{watch_ref.id}")
     if rewatch:
-        db.collection("videos").document(video_id).update({"rewatches": firestore.Increment(1)})
+        video_ref = db.collection("videos").document(video_id)
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def _increment_rewatch(transaction):
+            snapshot = video_ref.get(transaction=transaction)
+            if snapshot.exists:
+                current = _stored_int((snapshot.to_dict() or {}).get("rewatches"))
+                transaction.update(video_ref, {"rewatches": current + 1})
+
+        _increment_rewatch(transaction)
     return watch_ref.id
 
 
