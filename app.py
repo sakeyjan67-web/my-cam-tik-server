@@ -9,14 +9,21 @@ from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
 
 
-app = Flask(__name__)
+# ==========================
+# FLASK APP
+# ==========================
+
+app = Flask(
+    __name__,
+    template_folder="templates"
+)
 
 
-# =====================
+# ==========================
 # SETTINGS
-# =====================
+# ==========================
 
-UPLOAD_FOLDER = "uploads"
+UPLOAD_FOLDER = "/tmp/uploads"
 
 os.makedirs(
     UPLOAD_FOLDER,
@@ -24,15 +31,20 @@ os.makedirs(
 )
 
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN"
+)
 
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+CHANNEL_ID = os.getenv(
+    "CHANNEL_ID"
+)
 
 
 
-# =====================
-# FIREBASE
-# =====================
+# ==========================
+# FIREBASE CONNECT
+# ==========================
 
 db = None
 
@@ -46,9 +58,14 @@ try:
 
     if firebase_data:
 
-        cred = credentials.Certificate(
-            json.loads(firebase_data)
+        firebase_json = json.loads(
+            firebase_data
         )
+
+        cred = credentials.Certificate(
+            firebase_json
+        )
+
 
     else:
 
@@ -57,15 +74,19 @@ try:
         )
 
 
-    firebase_admin.initialize_app(
-        cred
-    )
+    if not firebase_admin._apps:
+
+        firebase_admin.initialize_app(
+            cred
+        )
 
 
     db = firestore.client()
 
 
-    print("Firebase Connected")
+    print(
+        "Firebase Connected"
+    )
 
 
 except Exception as e:
@@ -77,9 +98,9 @@ except Exception as e:
 
 
 
-# =====================
-# HOME
-# =====================
+# ==========================
+# HOME PAGE
+# ==========================
 
 @app.route("/")
 def home():
@@ -90,10 +111,9 @@ def home():
 
 
 
-# =====================
-# VIDEO UPLOAD
-# =====================
-
+# ==========================
+# UPLOAD VIDEO
+# ==========================
 
 @app.route(
     "/upload",
@@ -101,11 +121,22 @@ def home():
 )
 def upload():
 
-
     try:
 
 
+        if "video" not in request.files:
+
+            return jsonify({
+
+                "error":
+                "No video found"
+
+            }),400
+
+
+
         video = request.files["video"]
+
 
         title = request.form.get(
             "title",
@@ -113,86 +144,113 @@ def upload():
         )
 
 
+
         filename = secure_filename(
             video.filename
         )
 
 
-        path = os.path.join(
+        filepath = os.path.join(
             UPLOAD_FOLDER,
             filename
         )
 
 
-        video.save(path)
-
-
-
-        # TELEGRAM
-
-
-        url = (
-            "https://api.telegram.org/"
-            f"bot{TOKEN}/sendVideo"
+        video.save(
+            filepath
         )
 
 
-        with open(path,"rb") as f:
+
+        print(
+            "Sending to Telegram..."
+        )
 
 
-            r = requests.post(
 
-                url,
+        telegram_url = (
+            "https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/sendVideo"
+        )
+
+
+
+        with open(filepath,"rb") as file:
+
+
+            response = requests.post(
+
+                telegram_url,
 
                 data={
 
-                    "chat_id":CHANNEL_ID,
+                    "chat_id":
+                    CHANNEL_ID,
 
                     "caption":
                     f"Title: {title}"
 
                 },
 
+
                 files={
 
-                    "video":f
+                    "video":
+                    file
 
                 },
+
 
                 timeout=120
 
             )
 
 
-        result = r.json()
+
+        telegram_result = response.json()
 
 
 
-        if not result.get("ok"):
+        print(
+            telegram_result
+        )
+
+
+
+        if not telegram_result.get("ok"):
 
 
             return jsonify({
 
                 "error":
-                "Telegram failed",
+                "Telegram upload failed",
 
                 "detail":
-                result
+                telegram_result
 
             }),500
 
 
 
+
         file_id = (
-            result["result"]
+
+            telegram_result
+            ["result"]
             ["video"]
             ["file_id"]
+
+        )
+
+
+
+        print(
+            "Telegram Success"
         )
 
 
 
         # FIREBASE SAVE
-
 
         if db:
 
@@ -201,21 +259,32 @@ def upload():
                 "videos"
             ).add({
 
-                "title":title,
+                "title":
+                title,
 
-                "file_id":file_id,
+                "file_id":
+                file_id,
 
-                "filename":filename
+                "filename":
+                filename
 
             })
 
 
 
+            print(
+                "Firebase Save Success"
+            )
+
+
+
         return jsonify({
 
-            "success":True,
+            "success":
+            True,
 
-            "file_id":file_id
+            "file_id":
+            file_id
 
         })
 
@@ -224,10 +293,29 @@ def upload():
     except Exception as e:
 
 
+        print(
+            "SERVER ERROR:",
+            e
+        )
+
+
         return jsonify({
 
-            "error":str(e)
+            "error":
+            str(e)
 
         }),500
 
 
+
+
+# ==========================
+# LOCAL RUN
+# ==========================
+
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=5000
+    )
